@@ -130,16 +130,86 @@ configure_exporters() {
     fi
 }
 
+
+configure_service_args() {
+    local service="$1"
+    local target="$2"
+    local desired_args="$3"
+
+    [[ -f "$target" ]] ||
+        error "Missing service defaults: $target"
+
+    [[ ! -L "$target" ]] ||
+        error "Refusing symlink: $target"
+
+    local count
+    count="$(grep -c '^ARGS=' "$target" || true)"
+
+    [[ "$count" == 1 ]] ||
+        error "Expected exactly one ARGS entry in $target"
+
+    local staged
+    staged="$(mktemp)" || error "Cannot create temporary file"
+
+    # Preserve existing comments and other settings.
+    awk -v args="$desired_args" '
+        /^ARGS=/ {
+            print "ARGS=\"" args "\""
+            next
+        }
+        { print }
+    ' "$target" > "$staged" || {
+        rm -f "$staged"
+        error "Cannot prepare configuration: $target"
+    }
+
+    local changed=0
+
+    if install_config "$staged" "$target"; then
+        changed=1
+    fi
+
+    rm -f "$staged"
+
+    if (( changed )); then
+        log "Restarting $service..."
+        systemctl restart "$service" ||
+            error "Failed to restart $service"
+
+        systemctl is-active --quiet "$service" ||
+            error "$service is not active"
+    else
+        log "Arguments unchanged: $service"
+    fi
+}
+
+configure_service_defaults() {
+    log "Configuring service startup arguments..."
+
+    configure_service_args \
+        prometheus \
+        /etc/default/prometheus \
+        '--storage.tsdb.retention.time=14d --storage.tsdb.retention.size=2GB'
+
+    configure_service_args \
+        prometheus-process-exporter \
+        /etc/default/prometheus-process-exporter \
+        '-config.path=/etc/prometheus/process-exporter.yml'
+}
 main() {
     parse_args "$@"
     log "Starting Pi Monitoring Installer"
+
     check_root
     check_environment
     setup_grafana_repository
     install_packages
+
     configure_exporters
+    configure_service_defaults
+
     log "Configuration stage completed"
-    log "NOTE: Startup arguments, Grafana provisioning and health checks are not yet automated."
+    log "NOTE: Grafana provisioning and health checks are not yet automated."
 }
 
 main "$@"
