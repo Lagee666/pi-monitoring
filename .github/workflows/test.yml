@@ -1,3 +1,4 @@
+
 name: Installer Tests
 
 on:
@@ -10,7 +11,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Check Bash syntax
         run: |
@@ -26,8 +30,14 @@ jobs:
 
       - name: Validate dashboard JSON
         run: |
-          python3 -m json.tool grafana/dashboards/system-overview.json >/dev/null
-          python3 -m json.tool grafana/dashboards/process-overview.json >/dev/null
+          python3 -m json.tool grafana/dashboards/system-overview.json > /dev/null
+          python3 -m json.tool grafana/dashboards/process-overview.json > /dev/null
 
       - name: Check whitespace
-        run: git diff --check HEAD^ HEAD
+        run: |
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git show --format= --check HEAD
+          fi
+
