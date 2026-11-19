@@ -14,6 +14,8 @@ error() {
     exit 1
 }
 
+source "$SCRIPT_DIR/lib/config.sh"
+
 parse_args() {
     local arg
     for arg in "$@"; do
@@ -106,66 +108,6 @@ install_packages() {
     log "Installing: ${missing[*]}"
     apt-get update || error "apt-get update failed"
     apt-get install -y "${missing[@]}" || error "Package installation failed"
-}
-
-# Return 0 when content was installed/updated; return 1 when content is unchanged.
-# A conflict terminates the script. Must be called within an `if` condition.
-install_config() {
-    local source="$1"
-    local target="$2"
-    local key state_file current_hash expected_hash new_hash
-    local backup temp_target temp_state
-
-    [[ -f "$source" ]] || error "Missing source: $source"
-    [[ ! -L "$target" ]] || error "Refusing to manage symlink: $target"
-
-    key="$(printf '%s' "$target" | sha256sum | cut -d' ' -f1)"
-    state_file="$STATE_DIR/$key.sha256"
-    install -d -m 700 "$STATE_DIR" || error "Cannot create state directory"
-    new_hash="$(sha256sum "$source" | cut -d' ' -f1)"
-
-    if [[ -e "$target" ]]; then
-        [[ -f "$target" ]] || error "Target is not a regular file: $target"
-        current_hash="$(sha256sum "$target" | cut -d' ' -f1)"
-
-        if [[ -f "$state_file" ]]; then
-            expected_hash="$(cat "$state_file")"
-            [[ "$current_hash" == "$expected_hash" ]] ||
-                error "Managed configuration was edited: $target (refusing to overwrite)"
-        elif [[ "$current_hash" == "$new_hash" ]]; then
-            # An identical pre-existing config is safe to claim without touching it.
-            printf '%s\n' "$current_hash" > "$state_file" || error "Cannot record config ownership"
-            log "Adopted identical configuration: $target"
-            return 1
-        elif [[ "$ADOPT_CONFIG" != true ]]; then
-            error "Unmanaged configuration differs: $target (rerun with --adopt to back it up and take ownership)"
-        fi
-
-        if [[ "$current_hash" == "$new_hash" ]]; then
-            log "Unchanged: $target"
-            return 1
-        fi
-
-        # mktemp creates a unique backup name; cp -a preserves the original metadata.
-        backup="$(mktemp "${target}.bak.XXXXXXXX")" || error "Cannot allocate backup for $target"
-        cp -a "$target" "$backup" || error "Cannot back up $target"
-        log "Backup created: $backup"
-    elif [[ -f "$state_file" ]]; then
-        error "Previously managed configuration is missing: $target"
-    fi
-
-    # Write in the same directory and rename to avoid partially written config files.
-    install -d -m 755 "$(dirname "$target")" || error "Cannot create directory for $target"
-    temp_target="$(mktemp "${target}.new.XXXXXXXX")" || error "Cannot allocate temporary config"
-    install -m 644 "$source" "$temp_target" || error "Cannot stage $target"
-    mv -f "$temp_target" "$target" || error "Cannot install $target"
-
-    temp_state="$(mktemp "$STATE_DIR/.state.XXXXXXXX")" || error "Cannot allocate state file"
-    printf '%s\n' "$new_hash" > "$temp_state" || error "Cannot write state file"
-    mv -f "$temp_state" "$state_file" || error "Cannot record config ownership"
-
-    log "Installed: $target"
-    return 0
 }
 
 configure_exporters() {
