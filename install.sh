@@ -24,7 +24,6 @@ cleanup() {
 
 trap cleanup EXIT
 
-# Provides install_config(), SHA-256 ownership and backups.
 source "$SCRIPT_DIR/lib/config.sh"
 
 parse_args() {
@@ -39,10 +38,8 @@ parse_args() {
                 cat <<'HELP'
 Usage: sudo ./install.sh [--adopt]
 
-  --adopt   Back up and take ownership of existing unmanaged
-            configuration files that differ from this repository.
-
-            Does not overwrite manually modified managed files.
+  --adopt   Back up and adopt existing unmanaged configuration.
+            Never overwrite a manually modified managed config.
 
   --help    Show this help.
 HELP
@@ -70,7 +67,7 @@ check_environment() {
     source /etc/os-release
 
     [[ "${ID:-}" == debian ]] ||
-        error "Only Debian is currently supported"
+        error "Only Debian is supported"
 
     [[ "${VERSION_ID:-}" == 13 ]] ||
         error "Debian 13 is required"
@@ -81,14 +78,23 @@ check_environment() {
     command -v systemctl >/dev/null ||
         error "systemd is required"
 
-    [[ -f "$SCRIPT_DIR/config/prometheus.yml" ]] ||
-        error "Missing config/prometheus.yml"
+    local required=(
+        lib/config.sh
+        config/prometheus.yml
+        config/process-exporter.yml
+        grafana/grafana.env
+        grafana/systemd/override.conf
+        grafana/provisioning/datasources/prometheus.yml
+        grafana/provisioning/dashboards/pi-monitoring.yml
+        grafana/dashboards/system-overview.json
+        grafana/dashboards/process-overview.json
+    )
 
-    [[ -f "$SCRIPT_DIR/config/process-exporter.yml" ]] ||
-        error "Missing config/process-exporter.yml"
-
-    [[ -f "$SCRIPT_DIR/lib/config.sh" ]] ||
-        error "Missing lib/config.sh"
+    local file
+    for file in "${required[@]}"; do
+        [[ -f "$SCRIPT_DIR/$file" ]] ||
+            error "Missing file: $file"
+    done
 
     log "Environment check passed"
 }
@@ -98,8 +104,8 @@ setup_grafana_repository() {
 
     local list=/etc/apt/sources.list.d/grafana.list
     local key=/etc/apt/keyrings/grafana.asc
-
     local expected
+
     expected='deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main'
 
     if [[ -f "$list" && -s "$key" ]]; then
@@ -119,21 +125,19 @@ setup_grafana_repository() {
         error "apt-get update failed"
 
     apt-get install -y ca-certificates wget gnupg ||
-        error "Could not install APT prerequisites"
+        error "Cannot install APT prerequisites"
 
-    install -d -m 755 /etc/apt/keyrings ||
-        error "Cannot create APT keyring directory"
+    install -d -m 755 /etc/apt/keyrings
 
     local tmp_key
-    tmp_key="$(mktemp /tmp/pi-monitoring-grafana-key.XXXXXXXX)" ||
+    tmp_key="$(mktemp)" ||
         error "Cannot create temporary key file"
 
     if ! wget -qO "$tmp_key" \
         https://apt.grafana.com/gpg-full.key ||
         [[ ! -s "$tmp_key" ]]; then
-
         rm -f "$tmp_key"
-        error "Could not download Grafana signing key"
+        error "Cannot download Grafana signing key"
     fi
 
     install -m 644 "$tmp_key" "$key" ||
@@ -155,6 +159,8 @@ install_packages() {
         prometheus-node-exporter
         prometheus-process-exporter
         grafana
+        python3
+        wget
     )
 
     local missing=()
@@ -163,7 +169,6 @@ install_packages() {
     for pkg in "${packages[@]}"; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null |
             grep -qx 'install ok installed'; then
-
             log "$pkg already installed"
         else
             missing+=("$pkg")
@@ -184,8 +189,6 @@ install_packages() {
         error "Package installation failed"
 }
 
-# Generate the desired /etc/default configuration without
-# changing the original file.
 prepare_service_args() {
     local target="$1"
     local desired_args="$2"
@@ -201,7 +204,7 @@ prepare_service_args() {
     count="$(grep -c '^ARGS=' "$target" || true)"
 
     [[ "$count" == 1 ]] ||
-        error "Expected exactly one ARGS entry in $target"
+        error "Expected exactly one ARGS entry: $target"
 
     awk -v args="$desired_args" '
         /^ARGS=/ {
@@ -213,8 +216,7 @@ prepare_service_args() {
         error "Cannot prepare $target"
 }
 
-# Read-only conflict detection.
-# All target files are checked before any config is applied.
+# Read-only configuration ownership check.
 preflight_config() {
     local source="$1"
     local target="$2"
@@ -228,7 +230,9 @@ preflight_config() {
     [[ ! -L "$target" ]] ||
         error "Refusing symlink: $target"
 
-    key="$(printf '%s' "$target" | sha256sum | cut -d' ' -f1)"
+    key="$(printf '%s' "$target" |
+        sha256sum | cut -d' ' -f1)"
+
     state_file="$STATE_DIR/$key.sha256"
 
     new_hash="$(sha256sum "$source" | cut -d' ' -f1)"
@@ -253,7 +257,7 @@ preflight_config() {
             error "Managed config was modified: $target"
 
         if [[ "$current_hash" == "$new_hash" ]]; then
-            log "Configuration unchanged: $target"
+            log "Unchanged: $target"
         else
             log "Managed configuration update: $target"
         fi
@@ -272,9 +276,7 @@ preflight_config() {
     log "Will back up and adopt: $target"
 }
 
-# install_config returns:
-# 0 = changed
-# 1 = unchanged
+# Return 0 for changed and 1 for unchanged.
 apply_config() {
     local source="$1"
     local target="$2"
@@ -286,99 +288,131 @@ apply_config() {
     return 1
 }
 
-configure_monitoring() {
-    log "Preparing monitoring configurations..."
+prepare_configs() {
+    log "Preparing configurations..."
 
     WORK_DIR="$(mktemp -d)" ||
         error "Cannot create temporary directory"
 
-    local prometheus_config
-    local process_config
-    local prometheus_defaults
-    local process_defaults
-
-    prometheus_config="$SCRIPT_DIR/config/prometheus.yml"
-    process_config="$SCRIPT_DIR/config/process-exporter.yml"
-
-    prometheus_defaults="$WORK_DIR/prometheus-defaults"
-    process_defaults="$WORK_DIR/process-defaults"
-
-    # Validate configuration before changing system files.
-    promtool check config "$prometheus_config" ||
+    promtool check config \
+        "$SCRIPT_DIR/config/prometheus.yml" ||
         error "Invalid Prometheus configuration"
+
+    python3 -m json.tool \
+        "$SCRIPT_DIR/grafana/dashboards/system-overview.json" \
+        >/dev/null ||
+        error "Invalid System Overview JSON"
+
+    python3 -m json.tool \
+        "$SCRIPT_DIR/grafana/dashboards/process-overview.json" \
+        >/dev/null ||
+        error "Invalid Process Overview JSON"
 
     prepare_service_args \
         /etc/default/prometheus \
         '--storage.tsdb.retention.time=14d --storage.tsdb.retention.size=2GB' \
-        "$prometheus_defaults"
+        "$WORK_DIR/prometheus-defaults"
 
     prepare_service_args \
         /etc/default/prometheus-process-exporter \
         '-config.path=/etc/prometheus/process-exporter.yml' \
-        "$process_defaults"
+        "$WORK_DIR/process-defaults"
 
-    # Phase 1: check all conflicts before applying anything.
+    log "Configurations prepared"
+}
+
+# Central list of all managed configuration files.
+build_config_list() {
+    CONFIG_SOURCES=(
+        "$SCRIPT_DIR/config/prometheus.yml"
+        "$SCRIPT_DIR/config/process-exporter.yml"
+        "$WORK_DIR/prometheus-defaults"
+        "$WORK_DIR/process-defaults"
+        "$SCRIPT_DIR/grafana/grafana.env"
+        "$SCRIPT_DIR/grafana/systemd/override.conf"
+        "$SCRIPT_DIR/grafana/provisioning/datasources/prometheus.yml"
+        "$SCRIPT_DIR/grafana/provisioning/dashboards/pi-monitoring.yml"
+        "$SCRIPT_DIR/grafana/dashboards/system-overview.json"
+        "$SCRIPT_DIR/grafana/dashboards/process-overview.json"
+    )
+
+    CONFIG_TARGETS=(
+        /etc/prometheus/prometheus.yml
+        /etc/prometheus/process-exporter.yml
+        /etc/default/prometheus
+        /etc/default/prometheus-process-exporter
+        /etc/pi-monitoring/grafana.env
+        /etc/systemd/system/grafana-server.service.d/override.conf
+        /etc/grafana/provisioning/datasources/prometheus.yml
+        /etc/grafana/provisioning/dashboards/pi-monitoring.yml
+        /etc/grafana/dashboards/system-overview.json
+        /etc/grafana/dashboards/process-overview.json
+    )
+}
+
+check_all_conflicts() {
     log "Checking configuration conflicts..."
 
-    preflight_config \
-        "$prometheus_config" \
-        /etc/prometheus/prometheus.yml
+    local i
 
-    preflight_config \
-        "$process_config" \
-        /etc/prometheus/process-exporter.yml
+    for i in "${!CONFIG_SOURCES[@]}"; do
+        preflight_config \
+            "${CONFIG_SOURCES[$i]}" \
+            "${CONFIG_TARGETS[$i]}"
+    done
 
-    preflight_config \
-        "$prometheus_defaults" \
-        /etc/default/prometheus
+    log "Configuration preflight passed"
+}
 
-    preflight_config \
-        "$process_defaults" \
-        /etc/default/prometheus-process-exporter
+apply_all_configs() {
+    log "Applying configurations..."
 
-    # Phase 2: apply configuration changes.
-    log "Applying monitoring configurations..."
+    PROMETHEUS_CHANGED=0
+    PROCESS_CHANGED=0
+    GRAFANA_CHANGED=0
+    GRAFANA_UNIT_CHANGED=0
 
-    local prometheus_changed=0
-    local process_changed=0
+    local i
 
-    if apply_config \
-        "$prometheus_config" \
-        /etc/prometheus/prometheus.yml; then
-        prometheus_changed=1
-    fi
+    for i in "${!CONFIG_SOURCES[@]}"; do
+        if apply_config \
+            "${CONFIG_SOURCES[$i]}" \
+            "${CONFIG_TARGETS[$i]}"; then
 
-    if apply_config \
-        "$process_config" \
-        /etc/prometheus/process-exporter.yml; then
-        process_changed=1
-    fi
+            case "$i" in
+                0|2)
+                    PROMETHEUS_CHANGED=1
+                    ;;
+                1|3)
+                    PROCESS_CHANGED=1
+                    ;;
+                5)
+                    GRAFANA_CHANGED=1
+                    GRAFANA_UNIT_CHANGED=1
+                    ;;
+                4|6|7|8|9)
+                    GRAFANA_CHANGED=1
+                    ;;
+            esac
+        fi
+    done
 
-    if apply_config \
-        "$prometheus_defaults" \
-        /etc/default/prometheus; then
-        prometheus_changed=1
-    fi
+    log "Configurations applied"
+}
 
-    if apply_config \
-        "$process_defaults" \
-        /etc/default/prometheus-process-exporter; then
-        process_changed=1
-    fi
-
-    # Phase 3: start services, restarting changed ones only once.
+start_monitoring_services() {
     log "Starting monitoring services..."
 
     systemctl enable --now prometheus-node-exporter ||
-        error "Failed to start Node Exporter"
+        error "Cannot start Node Exporter"
 
     systemctl enable prometheus ||
-        error "Failed to enable Prometheus"
+        error "Cannot enable Prometheus"
 
     systemctl enable prometheus-process-exporter ||
-        error "Failed to enable Process Exporter"
+        error "Cannot enable Process Exporter"
 
-    if (( prometheus_changed )); then
+    if (( PROMETHEUS_CHANGED )); then
         log "Restarting Prometheus..."
         systemctl restart prometheus ||
             error "Prometheus restart failed"
@@ -387,7 +421,7 @@ configure_monitoring() {
             error "Prometheus start failed"
     fi
 
-    if (( process_changed )); then
+    if (( PROCESS_CHANGED )); then
         log "Restarting Process Exporter..."
         systemctl restart prometheus-process-exporter ||
             error "Process Exporter restart failed"
@@ -396,16 +430,95 @@ configure_monitoring() {
             error "Process Exporter start failed"
     fi
 
-    systemctl is-active --quiet prometheus ||
-        error "Prometheus is not active"
+    log "Monitoring services started"
+}
 
-    systemctl is-active --quiet prometheus-node-exporter ||
-        error "Node Exporter is not active"
+start_grafana() {
+    log "Starting Grafana..."
 
-    systemctl is-active --quiet prometheus-process-exporter ||
-        error "Process Exporter is not active"
+    if (( GRAFANA_UNIT_CHANGED )); then
+        log "Reloading systemd..."
+        systemctl daemon-reload ||
+            error "systemd reload failed"
+    fi
 
-    log "Monitoring services configured"
+    systemctl enable grafana-server ||
+        error "Cannot enable Grafana"
+
+    if (( GRAFANA_CHANGED )); then
+        log "Restarting Grafana..."
+        systemctl restart grafana-server ||
+            error "Grafana restart failed"
+    else
+        systemctl start grafana-server ||
+            error "Grafana start failed"
+    fi
+}
+
+# Returns success only when all services and endpoints respond.
+check_health() {
+    log "Checking service health..."
+
+    local service
+
+    for service in \
+        prometheus \
+        prometheus-node-exporter \
+        prometheus-process-exporter \
+        grafana-server; do
+
+        systemctl is-active --quiet "$service" ||
+            error "$service is not active"
+
+        log "$service is active"
+    done
+
+    log "Waiting for Grafana API..."
+
+    local response
+    local attempt
+
+    for (( attempt=1; attempt<=60; attempt++ )); do
+        response="$(
+            wget -qO- --timeout=2 \
+                http://127.0.0.1:3100/api/health \
+                2>/dev/null
+        )" || response=""
+
+        if [[ "$response" == *'"database":"ok"'* ]]; then
+            log "Grafana health check passed"
+            break
+        fi
+
+        if (( attempt == 60 )); then
+            error "Grafana health check failed"
+        fi
+
+        sleep 1
+    done
+
+    log "Checking Prometheus API..."
+
+    response="$(
+        wget -qO- --timeout=5 \
+            http://127.0.0.1:9090/-/ready \
+            2>/dev/null
+    )" || error "Prometheus readiness check failed"
+
+    log "Prometheus readiness check passed"
+
+    log "Checking exporter endpoints..."
+
+    wget -qO /dev/null --timeout=5 \
+        http://127.0.0.1:9100/metrics ||
+        error "Node Exporter metrics unavailable"
+
+    wget -qO /dev/null --timeout=5 \
+        http://127.0.0.1:9256/metrics ||
+        error "Process Exporter metrics unavailable"
+
+    log "Exporter endpoints passed"
+    log "All health checks passed"
 }
 
 main() {
@@ -418,10 +531,19 @@ main() {
 
     setup_grafana_repository
     install_packages
-    configure_monitoring
 
-    log "Configuration stage completed"
-    log "NOTE: Grafana provisioning and health checks are not yet automated."
+    prepare_configs
+    build_config_list
+    check_all_conflicts
+    apply_all_configs
+
+    start_monitoring_services
+    start_grafana
+    check_health
+
+    log "Pi Monitoring installation completed"
+    log "Grafana: http://127.0.0.1:3100"
+    log "Prometheus: http://127.0.0.1:9090"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
