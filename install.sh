@@ -1,11 +1,20 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="/var/lib/pi-monitoring/config-state"
+
 ADOPT_CONFIG=false
+DRY_RUN=false
 WORK_DIR=""
+
+PROMETHEUS_CHANGED=0
+PROCESS_CHANGED=0
+GRAFANA_CHANGED=0
+GRAFANA_UNIT_CHANGED=0
+
+PLAN_CONFLICTS=0
+PLAN_DEFERRED=0
 
 log() {
     printf '[INFO] %s\n' "$*"
@@ -24,6 +33,7 @@ cleanup() {
 
 trap cleanup EXIT
 
+# Existing configuration ownership module.
 source "$SCRIPT_DIR/lib/config.sh"
 
 parse_args() {
@@ -34,14 +44,24 @@ parse_args() {
             --adopt)
                 ADOPT_CONFIG=true
                 ;;
+            --dry-run)
+                DRY_RUN=true
+                ;;
             -h|--help)
                 cat <<'HELP'
-Usage: sudo ./install.sh [--adopt]
+Usage: sudo bash ./install.sh [OPTIONS]
 
-  --adopt   Back up and adopt existing unmanaged configuration.
-            Never overwrite a manually modified managed config.
+Options:
+  --dry-run  Preview changes without modifying the system.
+  --adopt    Back up and adopt existing unmanaged configs.
+             Never overwrite manually modified managed configs.
+  --help     Show this help.
 
-  --help    Show this help.
+Examples:
+  sudo bash ./install.sh --dry-run
+  sudo bash ./install.sh --dry-run --adopt
+  sudo bash ./install.sh
+  sudo bash ./install.sh --adopt
 HELP
                 exit 0
                 ;;
@@ -55,6 +75,27 @@ HELP
 check_root() {
     [[ "$EUID" -eq 0 ]] ||
         error "Please run with sudo"
+}
+
+check_sources() {
+    local files=(
+        lib/config.sh
+        config/prometheus.yml
+        config/process-exporter.yml
+        grafana/grafana.env
+        grafana/systemd/override.conf
+        grafana/provisioning/datasources/prometheus.yml
+        grafana/provisioning/dashboards/pi-monitoring.yml
+        grafana/dashboards/system-overview.json
+        grafana/dashboards/process-overview.json
+    )
+
+    local file
+
+    for file in "${files[@]}"; do
+        [[ -f "$SCRIPT_DIR/$file" ]] ||
+            error "Missing repository file: $file"
+    done
 }
 
 check_environment() {
@@ -78,26 +119,14 @@ check_environment() {
     command -v systemctl >/dev/null ||
         error "systemd is required"
 
-    local required=(
-        lib/config.sh
-        config/prometheus.yml
-        config/process-exporter.yml
-        grafana/grafana.env
-        grafana/systemd/override.conf
-        grafana/provisioning/datasources/prometheus.yml
-        grafana/provisioning/dashboards/pi-monitoring.yml
-        grafana/dashboards/system-overview.json
-        grafana/dashboards/process-overview.json
-    )
-
-    local file
-    for file in "${required[@]}"; do
-        [[ -f "$SCRIPT_DIR/$file" ]] ||
-            error "Missing file: $file"
-    done
+    check_sources
 
     log "Environment check passed"
 }
+
+# ------------------------------------------------------------
+# Grafana APT Repository
+# ------------------------------------------------------------
 
 setup_grafana_repository() {
     log "Checking Grafana APT repository..."
@@ -127,7 +156,8 @@ setup_grafana_repository() {
     apt-get install -y ca-certificates wget gnupg ||
         error "Cannot install APT prerequisites"
 
-    install -d -m 755 /etc/apt/keyrings
+    install -d -m 755 /etc/apt/keyrings ||
+        error "Cannot create APT keyring directory"
 
     local tmp_key
     tmp_key="$(mktemp)" ||
@@ -136,6 +166,7 @@ setup_grafana_repository() {
     if ! wget -qO "$tmp_key" \
         https://apt.grafana.com/gpg-full.key ||
         [[ ! -s "$tmp_key" ]]; then
+
         rm -f "$tmp_key"
         error "Cannot download Grafana signing key"
     fi
@@ -151,24 +182,34 @@ setup_grafana_repository() {
     log "Grafana repository configured"
 }
 
+# ------------------------------------------------------------
+# Package Installation
+# ------------------------------------------------------------
+
+required_packages=(
+    prometheus
+    prometheus-node-exporter
+    prometheus-process-exporter
+    grafana
+    python3
+    wget
+)
+
+package_installed() {
+    local pkg="$1"
+
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null |
+        grep -qx 'install ok installed'
+}
+
 install_packages() {
     log "Checking required packages..."
-
-    local packages=(
-        prometheus
-        prometheus-node-exporter
-        prometheus-process-exporter
-        grafana
-        python3
-        wget
-    )
 
     local missing=()
     local pkg
 
-    for pkg in "${packages[@]}"; do
-        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null |
-            grep -qx 'install ok installed'; then
+    for pkg in "${required_packages[@]}"; do
+        if package_installed "$pkg"; then
             log "$pkg already installed"
         else
             missing+=("$pkg")
@@ -189,11 +230,13 @@ install_packages() {
         error "Package installation failed"
 }
 
-prepare_service_args() {
+# ------------------------------------------------------------
+# Service Argument Generation
+# ------------------------------------------------------------
+
+render_service_args() {
     local target="$1"
     local desired_args="$2"
-    local output="$3"
-    local count
 
     [[ ! -L "$target" ]] ||
         error "Refusing symlink: $target"
@@ -201,6 +244,7 @@ prepare_service_args() {
     [[ -f "$target" ]] ||
         error "Missing service defaults: $target"
 
+    local count
     count="$(grep -c '^ARGS=' "$target" || true)"
 
     [[ "$count" == 1 ]] ||
@@ -212,11 +256,22 @@ prepare_service_args() {
             next
         }
         { print }
-    ' "$target" > "$output" ||
+    ' "$target"
+}
+
+prepare_service_args() {
+    local target="$1"
+    local desired_args="$2"
+    local output="$3"
+
+    render_service_args "$target" "$desired_args" > "$output" ||
         error "Cannot prepare $target"
 }
 
-# Read-only configuration ownership check.
+# ------------------------------------------------------------
+# Read-only Configuration Preflight
+# ------------------------------------------------------------
+
 preflight_config() {
     local source="$1"
     local target="$2"
@@ -276,7 +331,6 @@ preflight_config() {
     log "Will back up and adopt: $target"
 }
 
-# Return 0 for changed and 1 for unchanged.
 apply_config() {
     local source="$1"
     local target="$2"
@@ -287,6 +341,240 @@ apply_config() {
 
     return 1
 }
+
+# ------------------------------------------------------------
+# Dry Run: Read-only Planning
+# ------------------------------------------------------------
+
+plan_message() {
+    local status="$1"
+    local target="$2"
+
+    printf '[PLAN] %-10s %s\n' "$status" "$target"
+}
+
+plan_conflict() {
+    plan_message "CONFLICT" "$1"
+    PLAN_CONFLICTS=$((PLAN_CONFLICTS + 1))
+}
+
+plan_config_hash() {
+    local desired_hash="$1"
+    local target="$2"
+
+    local key state_file
+    local current_hash expected_hash
+
+    [[ ! -L "$target" ]] || {
+        plan_conflict "$target (symlink)"
+        return 0
+    }
+
+    key="$(printf '%s' "$target" |
+        sha256sum | cut -d' ' -f1)"
+
+    state_file="$STATE_DIR/$key.sha256"
+
+    if [[ ! -e "$target" ]]; then
+        if [[ -f "$state_file" ]]; then
+            plan_conflict "$target (managed file missing)"
+        else
+            plan_message "CREATE" "$target"
+        fi
+
+        return 0
+    fi
+
+    if [[ ! -f "$target" || ! -r "$target" ]]; then
+        plan_conflict "$target (not a readable regular file)"
+        return 0
+    fi
+
+    current_hash="$(sha256sum "$target" | cut -d' ' -f1)"
+
+    if [[ -f "$state_file" ]]; then
+        expected_hash="$(cat "$state_file")"
+
+        if [[ "$current_hash" != "$expected_hash" ]]; then
+            plan_conflict "$target (managed file modified)"
+            return 0
+        fi
+
+        if [[ "$current_hash" == "$desired_hash" ]]; then
+            plan_message "UNCHANGED" "$target"
+        else
+            plan_message "UPDATE" "$target"
+        fi
+
+        return 0
+    fi
+
+    if [[ "$current_hash" == "$desired_hash" ]]; then
+        plan_message "UNCHANGED" "$target (will record ownership)"
+        return 0
+    fi
+
+    if [[ "$ADOPT_CONFIG" == true ]]; then
+        plan_message "ADOPT" "$target (backup and replace)"
+    else
+        plan_conflict "$target (unmanaged; requires --adopt)"
+    fi
+}
+
+plan_config_file() {
+    local source="$1"
+    local target="$2"
+    local hash
+
+    if [[ ! -f "$source" || ! -r "$source" ]]; then
+        plan_conflict "$target (source missing or unreadable)"
+        return 0
+    fi
+
+    hash="$(sha256sum "$source" | cut -d' ' -f1)"
+
+    plan_config_hash "$hash" "$target"
+}
+
+plan_service_args() {
+    local target="$1"
+    local desired_args="$2"
+    local hash
+
+    # A fresh installation may not have Debian defaults yet.
+    if [[ ! -e "$target" ]]; then
+        plan_message "DEFERRED" "$target (requires package installation)"
+        PLAN_DEFERRED=$((PLAN_DEFERRED + 1))
+        return 0
+    fi
+
+    if [[ ! -f "$target" || ! -r "$target" || -L "$target" ]]; then
+        plan_conflict "$target (invalid defaults file)"
+        return 0
+    fi
+
+    local count
+    count="$(grep -c '^ARGS=' "$target" || true)"
+
+    if [[ "$count" != 1 ]]; then
+        plan_conflict "$target (expected exactly one ARGS entry)"
+        return 0
+    fi
+
+    hash="$(
+        render_service_args "$target" "$desired_args" |
+            sha256sum | cut -d' ' -f1
+    )"
+
+    plan_config_hash "$hash" "$target"
+}
+
+plan_repository() {
+    local list=/etc/apt/sources.list.d/grafana.list
+    local key=/etc/apt/keyrings/grafana.asc
+    local expected
+
+    expected='deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main'
+
+    if [[ ! -e "$list" && ! -e "$key" ]]; then
+        plan_message "CREATE" "Grafana APT repository"
+        return 0
+    fi
+
+    if [[ -f "$list" && -s "$key" ]] &&
+       grep -Fxq "$expected" "$list"; then
+        plan_message "UNCHANGED" "Grafana APT repository"
+    else
+        plan_conflict "Grafana APT repository (incomplete or different)"
+    fi
+}
+
+plan_packages() {
+    local pkg
+
+    for pkg in "${required_packages[@]}"; do
+        if package_installed "$pkg"; then
+            plan_message "UNCHANGED" "package: $pkg"
+        else
+            plan_message "INSTALL" "package: $pkg"
+        fi
+    done
+}
+
+dry_run() {
+    log "Pi Monitoring Dry Run"
+    log "Read-only mode: no changes will be applied"
+
+    check_sources
+
+    echo
+    log "Repository and packages"
+
+    plan_repository
+    plan_packages
+
+    echo
+    log "Prometheus configuration"
+
+    plan_config_file \
+        "$SCRIPT_DIR/config/prometheus.yml" \
+        /etc/prometheus/prometheus.yml
+
+    plan_config_file \
+        "$SCRIPT_DIR/config/process-exporter.yml" \
+        /etc/prometheus/process-exporter.yml
+
+    plan_service_args \
+        /etc/default/prometheus \
+        '--storage.tsdb.retention.time=14d --storage.tsdb.retention.size=2GB'
+
+    plan_service_args \
+        /etc/default/prometheus-process-exporter \
+        '-config.path=/etc/prometheus/process-exporter.yml'
+
+    echo
+    log "Grafana configuration"
+
+    plan_config_file \
+        "$SCRIPT_DIR/grafana/grafana.env" \
+        /etc/pi-monitoring/grafana.env
+
+    plan_config_file \
+        "$SCRIPT_DIR/grafana/systemd/override.conf" \
+        /etc/systemd/system/grafana-server.service.d/override.conf
+
+    plan_config_file \
+        "$SCRIPT_DIR/grafana/provisioning/datasources/prometheus.yml" \
+        /etc/grafana/provisioning/datasources/prometheus.yml
+
+    plan_config_file \
+        "$SCRIPT_DIR/grafana/provisioning/dashboards/pi-monitoring.yml" \
+        /etc/grafana/provisioning/dashboards/pi-monitoring.yml
+
+    plan_config_file \
+        "$SCRIPT_DIR/grafana/dashboards/system-overview.json" \
+        /etc/grafana/dashboards/system-overview.json
+
+    plan_config_file \
+        "$SCRIPT_DIR/grafana/dashboards/process-overview.json" \
+        /etc/grafana/dashboards/process-overview.json
+
+    echo
+    log "Dry run completed"
+    log "Conflicts: $PLAN_CONFLICTS"
+    log "Deferred checks: $PLAN_DEFERRED"
+    log "No changes applied"
+
+    if (( PLAN_CONFLICTS > 0 )); then
+        return 2
+    fi
+
+    return 0
+}
+
+# ------------------------------------------------------------
+# Actual Deployment
+# ------------------------------------------------------------
 
 prepare_configs() {
     log "Preparing configurations..."
@@ -317,11 +605,8 @@ prepare_configs() {
         /etc/default/prometheus-process-exporter \
         '-config.path=/etc/prometheus/process-exporter.yml' \
         "$WORK_DIR/process-defaults"
-
-    log "Configurations prepared"
 }
 
-# Central list of all managed configuration files.
 build_config_list() {
     CONFIG_SOURCES=(
         "$SCRIPT_DIR/config/prometheus.yml"
@@ -351,7 +636,7 @@ build_config_list() {
 }
 
 check_all_conflicts() {
-    log "Checking configuration conflicts..."
+    log "Checking all configuration conflicts..."
 
     local i
 
@@ -366,11 +651,6 @@ check_all_conflicts() {
 
 apply_all_configs() {
     log "Applying configurations..."
-
-    PROMETHEUS_CHANGED=0
-    PROCESS_CHANGED=0
-    GRAFANA_CHANGED=0
-    GRAFANA_UNIT_CHANGED=0
 
     local i
 
@@ -396,8 +676,6 @@ apply_all_configs() {
             esac
         fi
     done
-
-    log "Configurations applied"
 }
 
 start_monitoring_services() {
@@ -413,7 +691,6 @@ start_monitoring_services() {
         error "Cannot enable Process Exporter"
 
     if (( PROMETHEUS_CHANGED )); then
-        log "Restarting Prometheus..."
         systemctl restart prometheus ||
             error "Prometheus restart failed"
     else
@@ -422,31 +699,26 @@ start_monitoring_services() {
     fi
 
     if (( PROCESS_CHANGED )); then
-        log "Restarting Process Exporter..."
         systemctl restart prometheus-process-exporter ||
             error "Process Exporter restart failed"
     else
         systemctl start prometheus-process-exporter ||
             error "Process Exporter start failed"
     fi
-
-    log "Monitoring services started"
 }
 
 start_grafana() {
     log "Starting Grafana..."
 
     if (( GRAFANA_UNIT_CHANGED )); then
-        log "Reloading systemd..."
         systemctl daemon-reload ||
-            error "systemd reload failed"
+            error "systemd daemon-reload failed"
     fi
 
     systemctl enable grafana-server ||
         error "Cannot enable Grafana"
 
     if (( GRAFANA_CHANGED )); then
-        log "Restarting Grafana..."
         systemctl restart grafana-server ||
             error "Grafana restart failed"
     else
@@ -455,7 +727,6 @@ start_grafana() {
     fi
 }
 
-# Returns success only when all services and endpoints respond.
 check_health() {
     log "Checking service health..."
 
@@ -477,6 +748,7 @@ check_health() {
 
     local response
     local attempt
+    local healthy=false
 
     for (( attempt=1; attempt<=60; attempt++ )); do
         response="$(
@@ -486,28 +758,21 @@ check_health() {
         )" || response=""
 
         if [[ "$response" == *'"database":"ok"'* ]]; then
-            log "Grafana health check passed"
+            healthy=true
             break
-        fi
-
-        if (( attempt == 60 )); then
-            error "Grafana health check failed"
         fi
 
         sleep 1
     done
 
-    log "Checking Prometheus API..."
+    [[ "$healthy" == true ]] ||
+        error "Grafana health check failed"
 
-    response="$(
-        wget -qO- --timeout=5 \
-            http://127.0.0.1:9090/-/ready \
-            2>/dev/null
-    )" || error "Prometheus readiness check failed"
+    log "Grafana health check passed"
 
-    log "Prometheus readiness check passed"
-
-    log "Checking exporter endpoints..."
+    wget -qO /dev/null --timeout=5 \
+        http://127.0.0.1:9090/-/ready ||
+        error "Prometheus readiness check failed"
 
     wget -qO /dev/null --timeout=5 \
         http://127.0.0.1:9100/metrics ||
@@ -517,12 +782,22 @@ check_health() {
         http://127.0.0.1:9256/metrics ||
         error "Process Exporter metrics unavailable"
 
-    log "Exporter endpoints passed"
     log "All health checks passed"
 }
 
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
 main() {
     parse_args "$@"
+
+    # Dry run must exit before package installation
+    # and before any state or config writes.
+    if [[ "$DRY_RUN" == true ]]; then
+        dry_run
+        return $?
+    fi
 
     log "Starting Pi Monitoring Installer"
 
@@ -549,3 +824,4 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi
+
