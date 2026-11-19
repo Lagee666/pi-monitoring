@@ -33,12 +33,45 @@ check_environment() {
     log "Environment check passed"
 }
 
+install_packages() {
+    log "Checking required packages..."
+
+    local packages=(
+        prometheus
+        prometheus-node-exporter
+        prometheus-process-exporter
+        grafana
+    )
+
+    local missing=()
+
+    for pkg in "${packages[@]}"; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null \
+            | grep -qx "install ok installed"; then
+            log "$pkg already installed"
+        else
+            missing+=("$pkg")
+        fi
+    done
+
+    if (( ${#missing[@]} == 0 )); then
+        log "All required packages are installed"
+        return
+    fi
+
+    log "Installing: ${missing[*]}"
+
+    apt-get update
+    apt-get install -y "${missing[@]}"
+}
+
 main() {
     log "Starting Pi Monitoring Installer"
 
     check_environment
+    install_packages
 
-    log "Installer preflight completed"
+    log "Package installation completed"
 }
 
 main "$@"
