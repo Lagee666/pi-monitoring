@@ -762,6 +762,20 @@ check_health() {
             break
         fi
 
+	if python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+    sys.exit(0 if data.get("database") == "ok" else 1)
+except (ValueError, TypeError):
+    sys.exit(1)
+            ' <<< "$response"; then
+            healthy=true
+            break
+	fi
+
         sleep 1
     done
 
