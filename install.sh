@@ -33,6 +33,35 @@ check_environment() {
     log "Environment check passed"
 }
 
+setup_grafana_repository() {
+    log "Checking Grafana APT repository..."
+
+    if [[ -f /etc/apt/sources.list.d/grafana.list ]] &&
+       [[ -f /etc/apt/keyrings/grafana.asc ]]; then
+        log "Grafana repository already configured"
+        return
+    fi
+
+    log "Configuring Grafana APT repository..."
+
+    apt-get update
+    apt-get install -y ca-certificates wget gnupg
+
+    install -d -m 755 /etc/apt/keyrings
+
+    wget -qO /tmp/grafana.asc \
+        https://apt.grafana.com/gpg-full.key
+
+    install -m 644 /tmp/grafana.asc \
+        /etc/apt/keyrings/grafana.asc
+
+    cat > /etc/apt/sources.list.d/grafana.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main
+EOF
+
+    log "Grafana repository configured"
+}
+
 install_packages() {
     log "Checking required packages..."
 
@@ -69,6 +98,7 @@ main() {
     log "Starting Pi Monitoring Installer"
 
     check_environment
+    setup_grafana_repository
     install_packages
 
     log "Package installation completed"
