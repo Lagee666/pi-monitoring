@@ -1,0 +1,33 @@
+name: Installer Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n lib/config.sh
+          bash -n tests/test-config.sh
+          bash -n tests/test-service-args.sh
+
+      - name: Run unit tests
+        run: |
+          bash tests/test-config.sh
+          bash tests/test-service-args.sh
+
+      - name: Validate dashboard JSON
+        run: |
+          python3 -m json.tool grafana/dashboards/system-overview.json >/dev/null
+          python3 -m json.tool grafana/dashboards/process-overview.json >/dev/null
+
+      - name: Check whitespace
+        run: git diff --check HEAD^ HEAD
