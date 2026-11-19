@@ -1,17 +1,4 @@
 process_names:
   - name: "{{.Comm}}"
-    comm:
-      - chromium
-      - chrome
-      - cloudflared
-      - prometheus
-      - grafana
-      - grafana-server
-
-  - name: "job-watcher"
     cmdline:
-      - '.*job.watcher.*'
-
-  - name: "web-server"
-    cmdline:
-      - '.*web.server.*'
+      - '.+'

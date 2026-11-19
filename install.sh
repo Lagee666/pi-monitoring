@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 log() {
     echo "[INFO] $*"
@@ -94,14 +95,90 @@ install_packages() {
     apt-get install -y "${missing[@]}"
 }
 
+backup_and_install() {
+    local source="$1"
+    local target="$2"
+
+    if [[ -f "$target" ]] && cmp -s "$source" "$target"; then
+        log "Unchanged: $target"
+        return 1
+    fi
+
+    if [[ -f "$target" ]]; then
+        cp -a "$target" "${target}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+
+    install -D -m 644 "$source" "$target"
+    log "Updated: $target"
+    return 0
+}
+
+configure_prometheus() {
+    log "Configuring Prometheus..."
+
+    local changed=0
+
+    if backup_and_install \
+        "$SCRIPT_DIR/config/prometheus.yml" \
+        /etc/prometheus/prometheus.yml; then
+        changed=1
+    fi
+
+    if backup_and_install \
+        "$SCRIPT_DIR/config/process-exporter.yml" \
+        /etc/prometheus/process-exporter.yml; then
+        changed=1
+    fi
+
+    if (( changed )); then
+        systemctl restart prometheus
+        systemctl restart prometheus-process-exporter
+    fi
+}
+
+install_config() {
+    local source="$1"
+    local target="$2"
+
+    [[ -f "$source" ]] || error "Missing source: $source"
+
+    if [[ -f "$target" ]]; then
+        if cmp -s "$source" "$target"; then
+            log "Unchanged: $target"
+            return 0
+        fi
+
+        log "Existing configuration differs: $target"
+        log "Skipping to protect existing configuration"
+        return 0
+    fi
+
+    install -D -m 644 "$source" "$target"
+    log "Installed: $target"
+}
+
+configure_exporters() {
+    log "Configuring exporters..."
+
+    install_config \
+        "$SCRIPT_DIR/config/process-exporter.yml" \
+        "/etc/prometheus/process-exporter.yml"
+
+    install_config \
+        "$SCRIPT_DIR/config/prometheus.yml" \
+        "/etc/prometheus/prometheus.yml"
+}
+
 main() {
     log "Starting Pi Monitoring Installer"
 
     check_environment
     setup_grafana_repository
     install_packages
+    configure_prometheus
+    configure_exporters
 
-    log "Package installation completed"
+    log "Prometheus configuration completed"
 }
 
 main "$@"
